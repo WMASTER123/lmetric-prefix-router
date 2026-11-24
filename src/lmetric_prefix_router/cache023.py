@@ -1,5 +1,6 @@
 """Rank-local, reset-synchronized Qwen3.5 aligned cache evidence on vLLM 0.23."""
 
+import time
 from collections import Counter
 
 BLOCK = 2048
@@ -17,15 +18,26 @@ def block_key(value):
 class CacheView:
     """One publisher incarnation; stale/unknown evidence cannot select a rank."""
 
-    def __init__(self, rank):
+    def __init__(self, rank, block_size=BLOCK, specs=GROUPS):
         self.rank = rank
+        self.block_size, self.specs = block_size, specs
+        self.valid_until = None
+        self.generation_alive = None
         self.sequence = None
         self.trusted = False
         self.sync_state = "awaiting_baseline"
-        self.groups = [Counter() for _ in GROUPS]
+        self.groups = [Counter() for _ in specs]
         # Extra-key blocks still emit ordinary removals. Keep their references
         # outside the index used for plain completion lookups.
-        self.excluded = [Counter() for _ in GROUPS]
+        self.excluded = [Counter() for _ in specs]
+
+    @property
+    def ready(self):
+        return (
+            self.trusted
+            and (self.valid_until is None or time.monotonic() < self.valid_until)
+            and (self.generation_alive is None or self.generation_alive())
+        )
 
     def invalidate(self, reason="awaiting_baseline"):
         self.trusted = False
@@ -34,14 +46,16 @@ class CacheView:
             group.clear()
 
     def match(self, hashes, length):
-        if not self.trusted:
+        if not self.ready:
             return None
         result = 0
-        for i, key in enumerate(hashes[: max(0, length - 1) // BLOCK], start=1):
+        for i, key in enumerate(
+            hashes[: max(0, length - 1) // self.block_size], start=1
+        ):
             if key not in self.groups[0]:
                 break
             if all(key in g for g in self.groups[1:]):
-                result = i * BLOCK
+                result = i * self.block_size
         return result
 
     def apply(self, sequence, batch):
@@ -72,9 +86,9 @@ class CacheView:
                 return
             if (
                 type(group) is not int
-                or not 0 <= group < len(GROUPS)
-                or size != BLOCK
-                or spec != GROUPS[group]
+                or not 0 <= group < len(self.specs)
+                or size != self.block_size
+                or spec != self.specs[group]
                 or lora is not None
                 or name
                 or window
@@ -94,7 +108,7 @@ class CacheView:
             _, hashes, medium, group = event[:4]
             if medium not in (None, "GPU", "NPU"):
                 return
-            if type(group) is not int or not 0 <= group < len(GROUPS):
+            if type(group) is not int or not 0 <= group < len(self.specs):
                 raise ValueError("unknown removed group")
             for raw in hashes:
                 key = block_key(raw)

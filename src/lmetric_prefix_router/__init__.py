@@ -1,5 +1,1 @@
-"""lmetric-prefix-router inert contract descriptor."""
-
-
-class LmetricPrefixRouterContractProposal:
-    """Metadata-only proposal; this class performs no runtime activation."""
+"""Operator-managed prefix routing for shared vLLM deployments."""

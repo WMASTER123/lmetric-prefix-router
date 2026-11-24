@@ -1,6 +1,6 @@
 # lmetric-prefix-router
 
-当前开发目标为服务器预装 vLLM 0.23 的共享 DP 入口。每次选择一个完整 TP2 副本。可独立运行的开发网关与 Manager 描述符分别验证，当前 Manager 状态为 `import_only`。
+当前开发目标为服务器预装 vLLM 0.23 的共享 DP 入口。路由粒度是一个完整 DP 副本。使用本机绑定模式时，网关从实际引擎读取 DP/TP 配置，核对 HTTP 和各 rank 重放端口的进程归属。Manager 0.3 Provider 核验运行包、引擎代际和就绪状态；运维方管理启停、排空与切流。[部署与验收](docs/native023.md)
 
 ## 预装 0.23 主开发线
 

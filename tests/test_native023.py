@@ -179,6 +179,19 @@ def test_shared_http_entry_owns_rank_and_releases_stream_reservations(monkeypatc
                 state = await response.json()
             assert observed == ["1", None]
             assert state["active"] == 0
+            timing = state["recent_timings"][0]["elapsed_ns"]
+            marks = [
+                "parsed",
+                "fingerprinted",
+                "admission_start",
+                "pool_admitted",
+                "routing_complete",
+                "upstream_headers",
+                "first_body",
+                "first_visible_content",
+                "finished",
+            ]
+            assert [timing[k] for k in marks] == sorted(timing[k] for k in marks)
             assert state["route_reasons"] == {
                 "longest_prefix": 1,
                 "cache_view_unavailable": 1,

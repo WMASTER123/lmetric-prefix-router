@@ -4,19 +4,23 @@ import argparse
 import asyncio
 import json
 import time
-from collections import Counter
+from collections import Counter, deque
 from contextlib import suppress
 from dataclasses import dataclass
+from importlib.metadata import version
 
 import aiohttp
 from aiohttp import web
 
-from .cache023 import CacheView
+from .cache023 import BLOCK, GROUPS, CacheView
 from .events023 import EventStreams
 from .fingerprint023 import HostFingerprint
+from .managed023 import LocalEngine, ManagedReplay
 from .policy import Replica, choose_rank
+from .provider import BUNDLE_ID, DIST
 from .rank_metrics import poll_gauges
 from .receipts import UsageObserver
+from .timing import RequestTiming
 from .transport import BackendConfig, BackendConnectionPool, BackendPoolSaturated
 
 
@@ -28,7 +32,7 @@ class Reservation:
 
 
 class NativePool:
-    def __init__(self, policy="combined", rank_count=2):
+    def __init__(self, policy="combined", rank_count=2, block_size=BLOCK, specs=GROUPS):
         if policy not in {"combined", "native", "prefix"}:
             raise ValueError("unknown shared-endpoint policy")
         self.policy = policy
@@ -38,7 +42,9 @@ class NativePool:
         self.expected_ranks = set(range(rank_count))
         self.observed_ranks = None
         self.next_tie = 0
-        self.views = tuple(CacheView(rank) for rank in range(self.rank_count))
+        self.views = tuple(
+            CacheView(rank, block_size, specs) for rank in range(self.rank_count)
+        )
         self.gauges = {}
         self.active = set()
 
@@ -103,16 +109,37 @@ class NativePool:
 
 
 def application(
-    backend, event_port, fingerprint, policy="combined", rank_count=2, replay_port=None
+    backend,
+    event_port,
+    fingerprint,
+    policy="combined",
+    rank_count=2,
+    replay_port=None,
+    engine=None,
 ):
-    state = NativePool(policy, rank_count)
+    state = NativePool(
+        policy,
+        rank_count,
+        engine.block_size if engine else BLOCK,
+        engine.specs if engine else GROUPS,
+    )
     counters = Counter()
     reasons = Counter()
+    timings = deque(maxlen=64)
+    installed = version(DIST)
     pool = BackendConnectionPool(BackendConfig("shared-dp", backend))
     app = web.Application(client_max_size=8 * 1024 * 1024)
 
     async def resources(_app):
-        async with EventStreams(state.views, event_port, replay_port):
+        streams = (
+            ManagedReplay(state.views, engine)
+            if engine
+            else EventStreams(state.views, event_port, replay_port)
+        )
+        async with streams:
+            if engine and policy != "native":
+                with suppress(aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+                    await fingerprint.verify_chat(backend)
             await pool.start()
             poll = asyncio.create_task(poll_gauges(state, backend))
             try:
@@ -128,6 +155,19 @@ def application(
             dict(
                 profile="native023",
                 policy=policy,
+                extension_id=BUNDLE_ID,
+                version=installed,
+                backend=backend.rstrip("/"),
+                ready=bool(
+                    engine
+                    and state.expected_ranks == state.observed_ranks
+                    and all(v.ready for v in state.views)
+                    and all(
+                        r in state.gauges
+                        and 0 <= time.monotonic() - state.gauges[r][0] < 1
+                        for r in state.expected_ranks
+                    )
+                ),
                 counters=dict(counters),
                 route_reasons=dict(reasons),
                 expected_ranks=sorted(state.expected_ranks),
@@ -137,10 +177,26 @@ def application(
                     else None
                 ),
                 active=len(state.active),
+                topology={
+                    "dp": rank_count,
+                    "tp": engine.tp if engine else None,
+                    "source": "engine_process" if engine else "configuration",
+                },
+                chat_verified=getattr(fingerprint, "chat_verified", False),
+                engine_generation=engine.digest if engine else None,
+                replay_endpoints=(
+                    {
+                        str(r): f"tcp://127.0.0.1:{engine.replay_port + r}"
+                        for r in range(rank_count)
+                    }
+                    if engine
+                    else {}
+                ),
+                recent_timings=list(timings),
                 ranks=[
                     dict(
                         rank=v.rank,
-                        trusted=v.trusted,
+                        trusted=v.ready,
                         sequence=v.sequence,
                         sync_state=v.sync_state,
                     )
@@ -154,6 +210,7 @@ def application(
         )
 
     async def forward(request):
+        timing = RequestTiming()
         try:
             body = await request.read()
             payload = json.loads(body)
@@ -161,7 +218,9 @@ def application(
             raise web.HTTPBadRequest(text="invalid JSON") from exc
         if not isinstance(payload, dict):
             raise web.HTTPBadRequest(text="expected an object")
+        timing.mark("parsed")
         fp = None if policy == "native" else fingerprint(request.path, payload)
+        timing.mark("fingerprinted")
         headers = {"Content-Type": "application/json", "Accept-Encoding": "identity"}
         if "Authorization" in request.headers:
             headers["Authorization"] = request.headers["Authorization"]
@@ -174,6 +233,7 @@ def application(
             reasons[entry.reason] += 1
             if entry.rank is not None:
                 headers["X-Data-Parallel-Rank"] = str(entry.rank)
+            timing.mark("routing_complete")
 
         observer = UsageObserver(
             streaming=payload.get("stream") is True, observe_content=True
@@ -187,6 +247,7 @@ def application(
                 headers=headers,
                 allow_redirects=False,
                 before_dispatch=select,
+                timing=timing,
             ) as response:
                 info = {
                     "X-Lmetric-Reason": entry.reason,
@@ -203,12 +264,16 @@ def application(
                 stream = web.StreamResponse(status=response.status, headers=info)
                 await stream.prepare(request)
                 async for chunk in response.content.iter_any():
+                    timing.mark("first_body")
                     observer.feed(chunk)
                     if observer.has_content:
                         entry.prefill = 0
+                        timing.mark("first_visible_content")
                     await stream.write(chunk)
                 await stream.write_eof()
                 observer.finish()
+                timing.http_status = response.status
+                timing.terminal = "completed"
                 if 200 <= response.status < 300:
                     if predicted is None or observer.cached_tokens is None:
                         counters["unpaired"] += 1
@@ -230,6 +295,9 @@ def application(
         finally:
             if entry is not None:
                 state.active.discard(entry)
+                timing.node_id = "native" if entry.rank is None else str(entry.rank)
+            timing.mark("finished")
+            timings.append(timing.snapshot())
 
     app.cleanup_ctx.append(resources)
     app.router.add_get("/status", status)
@@ -244,22 +312,40 @@ def main():
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--served-model-name", required=True)
     parser.add_argument("--event-port", type=int, required=True)
-    parser.add_argument("--dp-size", type=int, choices=(1, 2), default=2)
+    parser.add_argument("--dp-size", type=int, choices=(1, 2))
+    parser.add_argument("--engine-pid", type=int)
     parser.add_argument("--replay-port", type=int)
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument(
         "--policy", choices=["combined", "prefix", "native"], default="combined"
     )
     args = parser.parse_args()
-    fp = HostFingerprint(args.model_path, args.served_model_name)
+    engine = None
+    if args.engine_pid is not None:
+        if args.replay_port is None:
+            parser.error("--engine-pid requires --replay-port")
+        engine = LocalEngine(
+            args.engine_pid,
+            args.backend,
+            args.model_path,
+            args.served_model_name,
+            args.event_port,
+            args.replay_port,
+        )
+        if args.dp_size is not None and args.dp_size != engine.dp:
+            parser.error("--dp-size disagrees with engine launch")
+    fp = HostFingerprint(
+        args.model_path, args.served_model_name, engine.block_size if engine else BLOCK
+    )
     web.run_app(
         application(
             args.backend,
             args.event_port,
             fp,
             args.policy,
-            args.dp_size,
+            engine.dp if engine else args.dp_size or 2,
             args.replay_port,
+            engine,
         ),
         host="127.0.0.1",
         port=args.port,

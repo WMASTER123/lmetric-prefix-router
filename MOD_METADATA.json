@@ -18,7 +18,7 @@
   "lifecycle": {
     "status": "experimental",
     "default_enabled": false,
-    "activation_contract": "Discovery only during qualification",
+    "activation_contract": "Operator-managed local native023 service. Manager verifies the bound deployment and records enable intent.",
     "rollback_contract": "Switch new traffic to the original engine, drain the standalone gateway, stop it, then uninstall the development package"
   },
   "scope": {

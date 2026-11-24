@@ -1,82 +1,85 @@
-# native023 共享入口开发指南
+# native023 本机共享引擎接入指南
 
-本宿主为预装 vLLM 0.23.0+empty、vLLM-Ascend 0.23.0，来源修订分别为 `0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665` 和 `5cb98caaadeff42b5b62b996e34bb2aaa29d20fd`。面向 Qwen3.5-35B-A3B BF16、文本模式，单机四张 910B2，TP2 × 内部 DP2。运行说明适用于单租户回环实验服务。r10 的准入、驻留状态和外部均衡语义另见[r10 接入条件](r10-qualification.md)。
+此开发包适配服务器预装的 vLLM `0.23.0+empty@0fc695fc` 和 vLLM-Ascend `0.23.0@5cb98caa`。使用单机、单租户、固定本地模型目录和一个共享 HTTP 入口。网站冻结引擎 r10 使用[独立接入条件](r10-qualification.md)。
 
-## 运行
+## 副本与设备
 
-在已有上列版本的服务器上创建能读取系统包的独立环境，从项目根目录安装 wheel 或源码。开发环境必须提供模型匹配的分词器、msgspec、pyzmq、aiohttp 和同一版本的 vLLM。保持推理栈由服务器管理。
+一次决策返回一个内部 DP rank 或委托原生。TP 组内的设备共同执行同一请求。当前网关支持 DP1 和 DP2。
 
-```sh
-python -m venv --system-site-packages .venv-native023
-.venv-native023/bin/python -m pip install '.[native023]'
-export PYTHONHASHSEED=42
-```
+| 引擎拓扑 | 路由行为 |
+|---|---|
+| DP1 × TP1 或 TP2 | 一个可选目的地。省略 rank 头，已知时仍返回缓存预测 |
+| DP2 × TP1 | 两个单卡副本，网关可以选择 rank 0 或 1 |
+| DP2 × TP2 | 两个双卡副本，路由目标同上；35B 四卡的当前候选仍须单独验收 |
 
-在该专用部署中，先在一个终端启动回环网关，模型路径换为服务器上与后端相同的快照。网关与引擎必须使用相同的哈希种子、算法、分词器和块哈希表示。
+## 运行已绑定的本地服务
 
-```sh
-.venv-native023/bin/python -m lmetric_prefix_router.native023 \
-  --backend http://127.0.0.1:18200 --dp-size 2 --event-port 18300 --replay-port 18400 --port 18201 \
-  --model-path /models/Qwen3.5-35B-A3B --served-model-name lab-model --policy combined
-```
-
-在另一个终端用服务器自带 Python 启动共享入口。先根据平台分配校验物理卡与逻辑卡映射，下面命令假定四张卡均已分配给当前容器。显式固定 hash 算法。仅在隔离功能验收环境设置 `VLLM_SERVER_DEV_MODE=1` 以允许操作员运行清缓存探针。
+在服务器创建独立环境，安装本开发包；Manager 使用仓库 requirements-manager.txt 固定的版本。使用与引擎相同的本地分词器、块哈希配置和固定 PYTHONHASHSEED。下例在两张已分配的 Ascend 910B2 上运行一个 35B 副本。启动引擎和网关的用户需要能读取同一 Linux PID 命名空间内的引擎进程与监听套接字。保持模型和配置文件在服务存续期间只读。
 
 ```sh
+python -m venv --system-site-packages .venv
+.venv/bin/pip install '.[native023]' -r requirements-manager.txt
 export PYTHONHASHSEED=42
 vllm serve /models/Qwen3.5-35B-A3B --served-model-name lab-model \
-  --host 127.0.0.1 --port 18200 --data-parallel-size 2 --tensor-parallel-size 2 \
+  --host 127.0.0.1 --port 18200 --data-parallel-size 1 --tensor-parallel-size 2 \
   --dtype bfloat16 --language-model-only --max-model-len 4096 --max-num-seqs 32 \
   --max-num-batched-tokens 4096 --gpu-memory-utilization 0.85 \
   --enable-prefix-caching --prefix-caching-hash-algo sha256 --enable-chunked-prefill \
   --enable-prompt-tokens-details --kv-events-config \
-  '{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://127.0.0.1:18300","replay_endpoint":"tcp://127.0.0.1:18400","buffer_steps":100000}'
+  '{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://127.0.0.1:18300","replay_endpoint":"tcp://127.0.0.1:18400","buffer_steps":100000}' &
+engine_pid=$!
 ```
 
-`GET /status` 在代理端展示 rank 视图、负载新鲜度、在途数和预测比对计数。引擎就绪由引擎端的 `/health` 核对。开发网关从不主动清缓存。受控实验在发布者连接后由操作员同步已知空起点，以下命令会重置整个测试引擎的缓存。
+等待引擎 `/health` 返回 200 后启动网关。绑定模式读取实际启动命令中的 DP 和 TP，并核对 API 监听端口、每个 rank 的独立 EngineCore 重放监听端口和进程归属。可另外传入 `--dp-size` 作为断言；不一致时启动失败。
 
 ```sh
-python experiments/probe_native023.py --engine http://127.0.0.1:18200 \
-  --router http://127.0.0.1:18201 --model lab-model --reset-isolated-engine
+.venv/bin/python -m lmetric_prefix_router.native023 --engine-pid "$engine_pid" \
+  --backend http://127.0.0.1:18200 --model-path /models/Qwen3.5-35B-A3B \
+  --served-model-name lab-model --event-port 18300 --replay-port 18400 --port 18201
 ```
 
-## 路由、回执及可靠性
+单全注意力接入面限定 Qwen2 架构、关闭滑窗、显式 `--block-size 128`。35B 混合布局使用 2048 块、全注意力连续链与三个 Mamba 组的共同终点。输入上限为 4096 tokens。适配其他模型需要分别核验块布局、哈希、分词和实际回执。
 
-`--dp-size` 填共享引擎的 DP 副本数。两卡承载同一个 TP2 时，两端均设 DP1。四卡承载两个 TP2 时，两端均设 DP2。网关用引擎 running/waiting 指标上的 engine 标签核对成员。DP1 正常省略 rank 头，已同步时仍可预测该唯一副本的命中。
+## 冷启动、恢复与可观测性
 
-响应头 `X-Lmetric-Reason` 和 `/status.route_reasons` 给出逐请求原因与累计次数。排查时先核对 expected_ranks 与 observed_metric_ranks，再看每个 rank 的 sync_state 和 gauges_fresh。
+- 默认生产候选路径使用上面的进程绑定。在固定版本的调度器中，新 EngineCore 建立发布者和空块池。网关从序号 0 连续重放到结束帧，可在无手动清缓存的情况下建立视图。每次事务前后检查原进程及套接字归属，派发时检查进程存活与视图期限。
+- 后台循环在每次事务结束后等待 250 ms，静默期间仍读取增量。每次最多 1024 批、8 MiB、1 秒。可重试超时保留已提交游标，恢复前暂停预测；断序或截断撤销索引。已发布但仍未处理的事件可能造成短时预测误差。1.25 秒未完成有效同步，停止使用该视图。进程换代后重新绑定新引擎并更新 Manager 配置。历史超过单次重建预算或已被覆盖时，可能持续委托原生。
+- 省略 `--engine-pid` 时保留早期开发用的实时订阅路径。此路径依赖清空基线，默认按 DP2 检查，可显式指定 DP1。Manager 的绑定就绪检查只认可有进程身份的路径。
+- 单条字符串或 token IDs 的 completions 可建立指纹。绑定模式启动时用单轮及多轮对话对照引擎 `/tokenize` 的完整 token IDs，通过后才开放纯文本的 system/user/assistant 消息。多模态、工具、自定义模板、salt 或未核验参数委托原生；额外身份键的存储与移除独立记账。
+- `/status` 提供拓扑、观测到的指标成员、缓存视图、负载新鲜度、各原因次数及最近 64 条请求的进程内分段计时。记录解析、指纹（含分词与哈希）、准入、发送前选点、引擎响应头、首个响应体、可见流内容及结束时刻。非流式回执在完成时解析。首个 HTTP 响应块不能直接用作客户端 TTFT。
+- `X-Lmetric-Reason` 将 `single_replica`、`all_miss`、`equal_hit_native` 与 `unsupported_input`、`topology_mismatch`、`topology_unverified`、`cache_view_unavailable` 分别计数。`longest_prefix` 主动选择最长命中副本；正命中相同且负载采样过期时使用本地积压估计。独立对照模式包括 `--policy native` 和 `--policy prefix`。
+- 负载使用引擎 running/waiting 以及代理在途记账。委托请求的实际副本通常无法从 HTTP 回执直接辨认。串行功能探针使用引擎各 rank 的查询与命中计数增量复核；并发性能实验需要独立的归属证据。
 
-| 路由原因 | 含义 |
-|---|---|
-| topology_unverified / topology_mismatch | 尚未取得有效成员指标，或已观察到的集合与部署配置不同 |
-| cache_view_unavailable / unsupported_input | 缺少缓存事件基线或连续历史，或此输入格式尚无法建立一致指纹 |
-| single_replica / native_policy | 已核对的单副本无需选点，或操作员显式选择原生策略 |
-| all_miss / equal_hit_native | 完整视图已知全冷，或正命中相等且各 rank 负载采样均在 0.6 秒内，按 combined 委托原生 |
-| longest_prefix / equal_hit_local_load | 正命中不同，保留最长命中；或正命中相等但采样过期，用本地积压和可用负载评分 |
-| prefix_policy | 独立最长前缀基线作出选择 |
+## Manager 与回滚
 
-- 当前正向定向覆盖普通单条字符串和 token ID completions。其他参数组合、带 salt、批量或 chat 交给同一引擎原生分配。响应头 X-Lmetric-Route 区分定向 rank 与原生委托，原生由哪个 rank 接收须另取引擎证据。客户端传入的 rank 头不参与派发。
-- 对每个 rank 维护一个全注意力组、三个递归状态组和每组引用计数。块长固定 2048。全注意力链前缀需连续，三个递归组需在同一终点同时可用；最多复用至最后一个输入 token 之前。新模型、新块长、LoRA、多租户身份需要重新验证。
-- 带额外身份键的已存块单独记引用，以便收到移除事件时正确扣减。普通请求的指纹只查普通索引。同一组若出现跨身份的外部哈希冲突，撤销该视图。带 salt 的请求仍委托原生。
-- 每个 rank 从实时或保留历史中的清空事件建立已知起点。断序、断连或不兼容事件撤销视图；断连后自动重建订阅。配置 replay 端口后，在后续实时帧触发按 rank 的有界重放，核对保留历史、序号及实时锚点的原始负载，再提交完整视图。单次最多回看 1024 帧、8 MiB、1 秒，重试间隔至少 2 秒。缺少清空基线、没有后续实时帧或历史被截断时，视图可能持续未知。重放不能证明引擎当前水位，尚无独立发布者代际证明或静默尾部丢失检测。业务服务不得通过周期性清空缓存维持就绪。
-- 在共享连接池准入后读取最新完整视图，计算决策再发送一次。按 rank 的 running/waiting 异步采样。在未知目的地的委托请求存续期间，按副本均摊其在途估计；首段可见流式输出后释放待 prefill 工作量。非流式请求直到终态释放。未识别输入只计请求数。成功响应中只有预测与实际 cached_tokens 均明确时计入一致/不一致计数，其他单列 unpaired。
-- `--policy native` 全部省略 rank；`--policy prefix` 对完整可信视图按最长前缀选点、平局轮换。比较时一次运行一个代理，同一负载、相同清空和预热步骤，另列引擎直连作代理开销对照。
-- 首版手动启动独立服务。回滚时把新流量切回共享引擎入口，等代理在途数归零后关闭代理。Manager 的发现、独占前门和启用资格独立审查，当前描述符保留发现模式。
+部署者核对启动命令、模型和 `/status` 中的拓扑后，将当前 `engine_generation` 的 64 位十六进制摘要、HTTP 地址及每个 rank 的 replay 端口保存为部署专用 JSON。Provider 核对正在运行的包版本、插件 ID、预期引擎代际、HTTP 与 replay 地址、combined 策略、所有 rank 就绪以及引擎 HTTP 健康。Manager 单独保存启用意图。
 
-事件格式和负载采样依据旧适配 b63ffe2。连接池和有界回执解析来自组织 Prefix Router，沿用 Apache-2.0；实验运行器和旧策略留在原仓。[组织实现](https://github.com/vLLM-HUST/vllm-hust-prefix-router/tree/bcc9691)
+```json
+{"router_url":"http://127.0.0.1:18201","backend_url":"http://127.0.0.1:18200","replay_endpoints":{"0":"tcp://127.0.0.1:18400"},"engine_generation":"<从本次部署核对的摘要>"}
+```
 
-## 组件复用与交付状态
+```sh
+id=io.github.wmaster123.lmetric-prefix-router
+.venv/bin/vllm-hust-ext extension configure "$id" --file binding.json
+.venv/bin/vllm-hust-ext extension check "$id"
+.venv/bin/vllm-hust-ext extension enable "$id"
+.venv/bin/vllm-hust-ext extension status "$id"
+```
 
-本分支提供可手动运行的外部网关，Manager 入口目前只支持发现。仓库维护者可以按下表核对组件接线和后续发布条件。
+运维方负责将请求入口切到网关。回滚时将新流量切回原引擎，等待 `/status.active` 归零，停止网关并执行 `extension disable`。Manager 的配置与启用不会搬迁正在生成的请求。
 
-| 组件 | 当前实现与改变 | 待验证项 |
+DP2 配置还应列出 `"1":"tcp://127.0.0.1:18401"`。确认无需保存意图后，可执行 `extension forget "$id"`，并在网关环境运行 `python -m pip uninstall lmetric-prefix-router`。
+
+## 功能验收与组件状态
+
+使用全新、无其他业务流量的专用引擎执行 `experiments/probe_managed023.py`。传入共享引擎和网关地址、served model、DP、TP 和块大小。探针检查初始查询计数为零，全程不调用清缓存接口。分别验证冷、单热、双热和文本聊天，各 rank 的引擎增量给出实际落点。例如单 TP2 使用 `--dp 1 --tp 2 --block 2048`。此探针不测性能。
+
+| 组件 | 当前实现 | 尚需单独验证 |
 |---|---|---|
-| 决策与在途记账 | 抽取 combined 纯函数。将连接池等待移到选点之前，在实际发送前同步选点和预留，在流结束、失败或取消时归还。 | 目标拓扑上测同步开销和在途估计误差 |
-| 请求指纹与缓存索引 | 使用部署环境的 tokenizer 和原生块哈希。按 rank 计数，验全注意力的连续链和三个 Mamba 组共同终点。 | chat 模板、额外模型或身份维度需独立核验 |
-| 负载采样、HTTP 与回执 | 从组织路由器移植 rank 采样、连接池和有界 JSON/SSE 观察器。共享入口使用一个连接池，负载异步采样，预测和实际同时可见才计入比对。 | 分段计时工具已有实现；主服务尚未输出完整的分词、准入、等待与返回耗时 |
-| 缓存失信与恢复 | 断序撤销索引，断连后重订阅，以保留的清空记录及实时帧恢复。恢复期间保留原生委托。 | 独立发布者代际、普通冷启动的已知空状态及静默尾部失同步检测 |
-| 管理器与服务生命周期 | 模板提供 manifest、唯一 bundle ID、部署级前门独占声明；操作员负责启动、排空和切流。 | Provider 需绑定运行配置摘要、运行包身份、后端健康和事件就绪，再验证 configure/check/enable/disable |
+| 决策与记账 | 复用 combined、发送前预留和终态释放；按已验证 DP 成员选点 | 大并发积压估计误差、35B 双 TP2 |
+| 请求与缓存 | 原生哈希、分模型布局、纯文本聊天模板对照、隔离带盐块 | 更多模型、模板与多租户 |
+| 转发与观测 | 复用连接池、有界 JSON/SSE 回执及计时工具，记录指纹和准入的在线开销 | 分场景 TTFT、停顿和有效吞吐 |
+| 恢复 | 本地进程与套接字绑定、从零连续重放、后台检查尾部、超时和进程退出退化 | 大历史重建及高压下恢复时间 |
+| 生命周期 | 模板 Manifest 0.3、独占前门、外部 Provider 和运维排空 | 网站冻结 r10 兼容性、真实部署切流 |
 
-产品仓保留实现、配置说明、回归测试和可重跑的功能探针。请求级原始记录、模型文件、旧策略成绩和评测数据集由实验环境保管。正式提交需要追溯结果时，用候选 revision、wheel SHA 和证据索引关联受控存储。开发态探针位于源码分发包，运行 wheel 仅包含运行模块、manifest、许可证与标准打包元数据。
-
-组织已有的外部服务示例将启用意图、运行状态核验和部署切流分开，可参照其 Provider 绑定与回滚次序。[Prefix Router 的 Manager 接入文档](https://github.com/vLLM-HUST/vllm-hust-prefix-router/blob/main/docs/extension-manager.md)
+产品仓保存运行组件、回归和可复跑的功能探针。原始请求、结果和性能数据留在实验环境。传输层、计时与回执来自组织 Prefix Router，许可证为 Apache-2.0。[组织组件](https://github.com/vLLM-HUST/vllm-hust-prefix-router/tree/bcc9691) · [组织 Provider 规范示例](https://github.com/vLLM-HUST/vllm-hust-prefix-router/blob/main/docs/extension-manager.md)
