@@ -3,22 +3,28 @@ requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
-name = "vllm-hust-extension-template-tools"
-version = "0.1.0"
-description = "Generator and acceptance tests for vLLM-HUST extensions"
+name = "lmetric-prefix-router"
+version = "0.1.0.dev0"
+description = "lmetric-prefix-router inert vLLM-HUST contract descriptor"
+readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
-dependencies = []
+dependencies = ["aiohttp>=3.10,<4"]
 
 [project.optional-dependencies]
-test = ["pytest>=8", "ruff>=0.12"]
+test = ["pytest>=8", "ruff>=0.12", "vllm-hust-ext @ git+https://github.com/vLLM-HUST/extension-manager.git@a39e78ca5d2b36bd09b878a1b6f48a6e61d9302d"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[project.entry-points."vllm_hust.extension_bundles"]
+"io.github.wmaster123.lmetric-prefix-router" = "lmetric_prefix_router"
 
 [tool.hatch.build.targets.wheel]
-packages = ["tools"]
+packages = ["src/lmetric_prefix_router"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["."]
 
 [tool.ruff]
 target-version = "py310"
