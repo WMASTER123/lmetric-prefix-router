@@ -18,10 +18,6 @@
     {
       "name": "openai.http",
       "version_range": null
-    },
-    {
-      "name": "vllm.kv-events",
-      "version_range": null
     }
   ],
   "implementation": [

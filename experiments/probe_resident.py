@@ -50,18 +50,21 @@ def main():
             ),
             flush=True,
         )
-        return choice
+        return choice, usage["prompt_tokens"]
 
     seed = "Explain this routing test. " + ("A replica spans two devices. " * 100)
-    first = complete(args.url, "cold", seed, run)
+    first, seed_length = complete(args.url, "cold", seed, run)
     if not first.get("prompt_token_ids") or not first.get("token_ids"):
         raise RuntimeError("No exact prompt/output token IDs for continuation probe")
+    if len(first["prompt_token_ids"]) != seed_length:
+        raise RuntimeError("API token IDs do not cover the reported prompt")
     history = first["prompt_token_ids"] + first["token_ids"]
     continuation = history + history[:12]
     if args.peer_url:
         complete(args.peer_url, "untouched-peer", continuation, run)
     complete(args.url, "same-replica-continuation", continuation, run)
     complete(args.url, "different-salt", continuation, uuid.uuid4().hex)
+    complete(args.url, "shared-document-new-question", seed + "What is TP?", run)
 
 
 if __name__ == "__main__":
