@@ -1,41 +1,29 @@
-# vLLM-HUST Extension Template
+# lmetric-prefix-router
 
-This GitHub template creates extensions that follow the vLLM-HUST Extension
-Manager boundary. It deliberately separates three shapes:
+Experimental prefix-aware placement for homogeneous vLLM-HUST serving replicas.
+The unit of placement is a model replica, which can span multiple Ascend devices.
+The current package implements the pure combined decision and a discovery-only
+descriptor. The Manager rejects activation until the target runtime is qualified.
 
-- `in_process_plugin`: code loaded by vLLM;
-- `kv_service_adapter`: a Provider that renders connector configuration and
-  checks an externally operated service without owning its lifecycle;
-- `import_only`: discoverable research metadata that the Manager must refuse to
-  enable until a real host contract exists.
+## Installation and tests
 
-## Create an extension
+From the repository root, run the following in a clean Python environment:
 
-Use this repository as a GitHub template, then run:
-
-```bash
-python tools/new_extension.py \
-  --kind in_process_plugin \
-  --name my-extension \
-  --extension-id org.vllm-hust.my-extension \
-  --output generated/my-extension
+```sh
+python -m pip install -e ".[test]"
+python -m pytest -q tests
+vllm-hust-ext extension inspect io.github.wmaster123.lmetric-prefix-router
 ```
 
-For an external KV system, select `kv_service_adapter` and add
-`--provider-name my-kv-system`. For an inert contract proposal, select
-`import_only`.
+## Target and provenance
 
-The generated repository contains a static Manifest 0.3 descriptor,
-`MOD_METADATA.json`, package entry points, tests, build metadata, and CI.
-Replace every example
-implementation and compatibility range with evidence from the real project.
+The target is Qwen3.5-35B-A3B BF16 on the frozen HUST r10 release
+(`2026.11.21.10`). Its model admission explicitly requires TP2/DP1.
+The prior 0.23 shared internal-DP tests do not qualify this release.
+A deployment consisting of two independent TP2 endpoints requires a separately
+identified external dispatch policy for equal hits and misses.
 
-The Manager dependency is installed from the immutable source revision in
-`requirements-manager.txt`, not from an unpublished development version on PyPI.
-The generator carries that same requirement into package metadata and CI for all
-three profiles. Updating it requires rerunning generated-package installation,
-discovery, and import-only rejection tests. Generated packages need Git/network
-access to install this source dependency; no shared service is started.
-
-See [README.zh.md](README.zh.md) and [CONTRIBUTING.md](CONTRIBUTING.md) for the
-required review checklist.
+- Scaffold: [HUST template at 4163473](https://github.com/vLLM-HUST/extension-template/tree/416347398ba197a4db5e4360db1aaecc64355b79).
+- Decision semantics: WMASTER123's lmetric-combined routing experiments.
+- Target runtime: [r10 frozen artifacts](https://github.com/vLLM-HUST/vllm-hust-website/releases/tag/engine-wheels-r10-v1).
+- External router interfaces and reliability reference: [HUST Prefix Router](https://github.com/vLLM-HUST/vllm-hust-prefix-router).
