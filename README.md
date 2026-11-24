@@ -1,6 +1,6 @@
 # lmetric-prefix-router
 
-面向 vLLM-HUST 的实验性前缀路由 MOD。每次选择一个完整模型副本，TP2 的两张卡共同接收并执行该请求。当前 Manager 描述符为 `import_only`，宿主资格验证进展见[验证记录](docs/r10-qualification.md)。
+面向 vLLM-HUST 的实验性前缀路由 MOD。每次选择一个完整模型副本，TP2 的两张卡共同接收并执行该请求。当前 Manager 描述符为 `import_only`，部署要求见[宿主接入条件](docs/r10-qualification.md)。
 
 ## r10 双端点变体
 

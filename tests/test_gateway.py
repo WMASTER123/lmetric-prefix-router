@@ -1,5 +1,5 @@
 import asyncio
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, suppress
 
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
@@ -58,5 +58,52 @@ def test_stream_dispatch_and_epoch_check():
             async with client.post(path, data="stale") as response:
                 assert response.status == 503
             assert seen == ["hold", "cold", "warm"]
+
+    asyncio.run(run())
+
+
+def test_disconnect_releases_inflight_while_backend_has_no_output():
+    async def run():
+        arrived, disconnected = asyncio.Event(), asyncio.Event()
+        observations = []
+
+        async def backend(request):
+            if await request.text() == "hold":
+                arrived.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    disconnected.set()
+            return web.Response(text="ok")
+
+        def observer(path, body, counts):
+            observations.append(counts)
+            return None
+
+        async with AsyncExitStack() as stack:
+            urls = []
+            for _ in range(2):
+                upstream = web.Application()
+                upstream.router.add_post("/v1/completions", backend)
+                server = await stack.enter_async_context(
+                    TestServer(upstream, handler_cancellation=True)
+                )
+                urls.append(str(server.make_url("/")))
+            client = await stack.enter_async_context(
+                TestClient(
+                    TestServer(
+                        application(tuple(urls), observer), handler_cancellation=True
+                    )
+                )
+            )
+            task = asyncio.ensure_future(client.post("/v1/completions", data="hold"))
+            await asyncio.wait_for(arrived.wait(), timeout=5)
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+            await asyncio.wait_for(disconnected.wait(), timeout=5)
+            async with client.post("/v1/completions", data="next") as response:
+                assert await response.text() == "ok"
+            assert observations == [(0, 0), (0, 0)]
 
     asyncio.run(run())
