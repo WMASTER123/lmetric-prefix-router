@@ -24,15 +24,19 @@ from .transport import BackendConfig, BackendConnectionPool, BackendPoolSaturate
 class Reservation:
     rank: int | None
     prefill: int
+    reason: str
 
 
 class NativePool:
-    rank_count = 2
-
-    def __init__(self, policy="combined"):
+    def __init__(self, policy="combined", rank_count=2):
         if policy not in {"combined", "native", "prefix"}:
             raise ValueError("unknown shared-endpoint policy")
         self.policy = policy
+        if rank_count not in (1, 2):
+            raise ValueError("native023 supports one or two DP ranks")
+        self.rank_count = rank_count
+        self.expected_ranks = set(range(rank_count))
+        self.observed_ranks = None
         self.next_tie = 0
         self.views = tuple(CacheView(rank) for rank in range(self.rank_count))
         self.gauges = {}
@@ -59,29 +63,56 @@ class NativePool:
             replicas.append(Replica(hit, count, pending, age))
         hits = [r.matched_tokens for r in replicas]
         selected = None
-        if self.policy == "combined":
+        predicted = None
+        if self.policy == "native":
+            reason = "native_policy"
+        elif fingerprint is None:
+            reason = "unsupported_input"
+        elif self.observed_ranks != self.expected_ranks:
+            reason = (
+                "topology_unverified"
+                if self.observed_ranks is None
+                else "topology_mismatch"
+            )
+        elif None in hits:
+            reason = "cache_view_unavailable"
+        elif self.rank_count == 1:
+            reason = "single_replica"
+            predicted = hits[0]
+        elif self.policy == "combined":
             selected = choose_rank(length, tuple(replicas))
-        elif self.policy == "prefix" and None not in hits:
+            if max(hits) == 0:
+                reason = "all_miss"
+            elif selected is None:
+                reason = "equal_hit_native"
+            elif len(set(hits)) == 1:
+                reason = "equal_hit_local_load"
+            else:
+                reason = "longest_prefix"
+            predicted = hits[selected] if selected is not None else hits[0]
+        else:
             owners = [r for r, hit in enumerate(hits) if hit == max(hits)]
             selected = owners[self.next_tie % len(owners)]
             if len(owners) > 1:
                 self.next_tie += 1
-        predicted = hits[0] if hits[0] == hits[1] else None
-        if selected is not None:
             predicted = hits[selected]
-        entry = Reservation(selected, length - (predicted or 0))
+            reason = "prefix_policy"
+        entry = Reservation(selected, length - (predicted or 0), reason)
         self.active.add(entry)
         return entry, predicted
 
 
-def application(backend, event_port, fingerprint, policy="combined"):
-    state = NativePool(policy)
+def application(
+    backend, event_port, fingerprint, policy="combined", rank_count=2, replay_port=None
+):
+    state = NativePool(policy, rank_count)
     counters = Counter()
+    reasons = Counter()
     pool = BackendConnectionPool(BackendConfig("shared-dp", backend))
     app = web.Application(client_max_size=8 * 1024 * 1024)
 
     async def resources(_app):
-        async with EventStreams(state.views, event_port):
+        async with EventStreams(state.views, event_port, replay_port):
             await pool.start()
             poll = asyncio.create_task(poll_gauges(state, backend))
             try:
@@ -98,9 +129,21 @@ def application(backend, event_port, fingerprint, policy="combined"):
                 profile="native023",
                 policy=policy,
                 counters=dict(counters),
+                route_reasons=dict(reasons),
+                expected_ranks=sorted(state.expected_ranks),
+                observed_metric_ranks=(
+                    sorted(state.observed_ranks)
+                    if state.observed_ranks is not None
+                    else None
+                ),
                 active=len(state.active),
                 ranks=[
-                    dict(rank=v.rank, trusted=v.trusted, sequence=v.sequence)
+                    dict(
+                        rank=v.rank,
+                        trusted=v.trusted,
+                        sequence=v.sequence,
+                        sync_state=v.sync_state,
+                    )
                     for v in state.views
                 ],
                 gauges_fresh=[
@@ -128,6 +171,7 @@ def application(backend, event_port, fingerprint, policy="combined"):
             nonlocal entry, predicted
             entry, predicted = state.reserve(fp)
             counters["delegated" if entry.rank is None else "pinned"] += 1
+            reasons[entry.reason] += 1
             if entry.rank is not None:
                 headers["X-Data-Parallel-Rank"] = str(entry.rank)
 
@@ -145,6 +189,7 @@ def application(backend, event_port, fingerprint, policy="combined"):
                 before_dispatch=select,
             ) as response:
                 info = {
+                    "X-Lmetric-Reason": entry.reason,
                     "X-Lmetric-Route": "native"
                     if entry.rank is None
                     else str(entry.rank),
@@ -199,6 +244,8 @@ def main():
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--served-model-name", required=True)
     parser.add_argument("--event-port", type=int, required=True)
+    parser.add_argument("--dp-size", type=int, choices=(1, 2), default=2)
+    parser.add_argument("--replay-port", type=int)
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument(
         "--policy", choices=["combined", "prefix", "native"], default="combined"
@@ -206,7 +253,14 @@ def main():
     args = parser.parse_args()
     fp = HostFingerprint(args.model_path, args.served_model_name)
     web.run_app(
-        application(args.backend, args.event_port, fp, args.policy),
+        application(
+            args.backend,
+            args.event_port,
+            fp,
+            args.policy,
+            args.dp_size,
+            args.replay_port,
+        ),
         host="127.0.0.1",
         port=args.port,
         handler_cancellation=True,

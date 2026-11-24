@@ -65,7 +65,9 @@ class HostFingerprint:
             return None
         hashes = []
         parent = None
-        for start in range(0, len(tokens) - BLOCK + 1, BLOCK):
+        # vLLM recomputes the last token, so the last full block at an exact
+        # boundary is ineligible even when its hash exists in the cache.
+        for start in range(0, len(tokens) - BLOCK, BLOCK):
             parent = self.hash_block(
                 self.function,
                 parent,

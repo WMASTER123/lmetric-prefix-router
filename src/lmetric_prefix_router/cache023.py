@@ -21,11 +21,16 @@ class CacheView:
         self.rank = rank
         self.sequence = None
         self.trusted = False
+        self.sync_state = "awaiting_baseline"
         self.groups = [Counter() for _ in GROUPS]
+        # Extra-key blocks still emit ordinary removals. Keep their references
+        # outside the index used for plain completion lookups.
+        self.excluded = [Counter() for _ in GROUPS]
 
-    def invalidate(self):
+    def invalidate(self, reason="awaiting_baseline"):
         self.trusted = False
-        for group in self.groups:
+        self.sync_state = reason
+        for group in (*self.groups, *self.excluded):
             group.clear()
 
     def match(self, hashes, length):
@@ -41,19 +46,20 @@ class CacheView:
 
     def apply(self, sequence, batch):
         try:
-            if len(batch) < 3 or batch[2] != self.rank:
+            if len(batch) < 3 or type(batch[2]) is not int or batch[2] != self.rank:
                 raise ValueError("unexpected publisher rank")
             if self.sequence is not None and sequence != self.sequence + 1:
-                self.invalidate()
+                self.invalidate("sequence_gap")
             self.sequence = sequence
             for event in batch[1]:
                 if event[0] == "AllBlocksCleared":
                     self.invalidate()
                     self.trusted = True
+                    self.sync_state = "observed_contiguous"
                 elif self.trusted:
                     self._change(event)
         except (ValueError, TypeError, IndexError, KeyError):
-            self.invalidate()
+            self.invalidate("invalid_event")
             raise
 
     def _change(self, event):
@@ -71,11 +77,19 @@ class CacheView:
                 or spec != GROUPS[group]
                 or lora is not None
                 or name
-                or (extras and any(extras))
                 or window
             ):
                 raise ValueError("unqualified cache layout or identity")
-            self.groups[group].update(block_key(k) for k in hashes)
+            if extras and len(extras) != len(hashes):
+                raise ValueError("incomplete block identities")
+            plain, excluded = self.groups[group], self.excluded[group]
+            for i, raw in enumerate(hashes):
+                key = block_key(raw)
+                qualified = not (extras and extras[i])
+                dest, other = (plain, excluded) if qualified else (excluded, plain)
+                if key in other:
+                    raise ValueError("ambiguous external hash across identities")
+                dest[key] += 1
         elif kind == "BlockRemoved":
             _, hashes, medium, group = event[:4]
             if medium not in (None, "GPU", "NPU"):
@@ -84,7 +98,11 @@ class CacheView:
                 raise ValueError("unknown removed group")
             for raw in hashes:
                 key = block_key(raw)
-                counts = self.groups[group]
+                counts = (
+                    self.excluded[group]
+                    if key in self.excluded[group]
+                    else self.groups[group]
+                )
                 if not counts[key]:
                     raise ValueError("removal has no corresponding stored block")
                 counts[key] -= 1

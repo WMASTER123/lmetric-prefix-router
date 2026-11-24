@@ -55,11 +55,29 @@ def test_bad_removal_invalidates_view():
     assert not v.trusted
 
 
+def test_extra_key_stores_and_removals_preserve_other_prefixes():
+    view = CacheView(0)
+    plain, salted = block_key(1), block_key(2)
+    events = [store(group, [plain, salted]) for group in range(len(GROUPS))]
+    for event in events:
+        event[8] = [None, ["probe-salt"]]
+    view.apply(0, [0, [["AllBlocksCleared"], *events], 0])
+    assert view.match([plain], 2600) == BLOCK
+    assert view.match([salted], 2600) == 0
+    view.apply(1, [0, [["BlockRemoved", [salted], "GPU", 0]], 0])
+    assert view.trusted and view.match([plain], 2600) == BLOCK
+    clash = store(1, [salted])
+    with pytest.raises(ValueError, match="ambiguous"):
+        view.apply(2, [0, [clash], 0])
+    assert not view.trusted
+
+
 @pytest.mark.parametrize(
     "policy,route", [("combined", 1), ("prefix", 1), ("native", None)]
 )
 def test_shared_host_decision(policy, route):
     pool = NativePool(policy)
+    pool.observed_ranks = {0, 1}
     keys = [block_key(1)]
     for v in pool.views:
         events = [["AllBlocksCleared"]]
@@ -91,7 +109,7 @@ def test_shared_http_entry_owns_rank_and_releases_stream_reservations(monkeypatc
     observed = []
 
     @asynccontextmanager
-    async def feed(views, port):
+    async def feed(views, port, replay_port):
         feeds.extend(views)
         for v in views:
             events = [["AllBlocksCleared"]]
@@ -120,6 +138,16 @@ def test_shared_http_entry_owns_rank_and_releases_stream_reservations(monkeypatc
     async def run():
         async with AsyncExitStack() as stack:
             upstream = web.Application()
+
+            async def metrics(request):
+                text = "\n".join(
+                    f'vllm:num_requests_{kind}{{engine="{rank}"}} 0'
+                    for rank in (0, 1)
+                    for kind in ("running", "waiting")
+                )
+                return web.Response(text=text)
+
+            upstream.router.add_get("/metrics", metrics)
             upstream.router.add_post("/v1/completions", generate)
             server = await stack.enter_async_context(TestServer(upstream))
             app = native023.application(
@@ -128,10 +156,16 @@ def test_shared_http_entry_owns_rank_and_releases_stream_reservations(monkeypatc
             client = await stack.enter_async_context(TestClient(TestServer(app)))
             url = "/v1/completions"
             headers = {"X-Data-Parallel-Rank": "0"}
+            for _ in range(100):
+                async with client.get("/status") as status:
+                    if (await status.json())["observed_metric_ranks"] == [0, 1]:
+                        break
+                await asyncio.sleep(0.01)
             async with client.post(
                 url, json={"stream": True}, headers=headers
             ) as response:
                 assert response.headers["X-Lmetric-Route"] == "1"
+                assert response.headers["X-Lmetric-Reason"] == "longest_prefix"
                 assert response.headers["X-Lmetric-Expected-Cached"] == "2048"
                 assert b"[DONE]" in await response.read()
             feeds[0].invalidate()
@@ -139,11 +173,16 @@ def test_shared_http_entry_owns_rank_and_releases_stream_reservations(monkeypatc
                 url, json={"stream": False}, headers=headers
             ) as response:
                 assert response.headers["X-Lmetric-Route"] == "native"
+                assert response.headers["X-Lmetric-Reason"] == "cache_view_unavailable"
                 await response.read()
             async with client.get("/status") as response:
                 state = await response.json()
             assert observed == ["1", None]
             assert state["active"] == 0
+            assert state["route_reasons"] == {
+                "longest_prefix": 1,
+                "cache_view_unavailable": 1,
+            }
             assert state["counters"] == {
                 "pinned": 1,
                 "matched": 1,
