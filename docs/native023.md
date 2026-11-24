@@ -12,6 +12,10 @@
 | DP2 × TP1 | 两个单卡副本，网关可以选择 rank 0 或 1 |
 | DP2 × TP2 | 两个双卡副本，路由目标同上；35B 四卡的当前候选仍须单独验收 |
 
+在此版本中，一个 DP rank 对应一个 EngineCore 调度器。调度器产生一次逻辑前缀命中长度并发布该 rank 的缓存事件，TP worker 按同一份调度结果协作计算。一个 TP2 副本复用 2048 个输入 token 时，两个 worker 使用各自需要的状态分片，按请求统计 2048。单卡 HBM 使用量能帮助诊断资源瓶颈，不能据此推断前缀长度或指定承接请求的 TP worker。部署排查可在对应引擎版本查阅 `KVCacheManager.get_computed_blocks`、`Scheduler` 的 KVEventBatch 发布处与 `MultiprocExecutor.execute_model`。
+
+网关分别在每个 DP rank 的视图内检查全注意力前缀链和各 Mamba 组的共同终点，再比较副本。两个副本即使各持有所需缓存的一部分，也不能合并成一次命中。视图可信表示该引擎代际的事件已按序同步且仍有效。可信视图既能给出正命中，也能给出已知零命中。`single_replica` 表示已确认只有一个可路由的完整副本，此时仍可验证预测。
+
 ## 运行已绑定的本地服务
 
 在服务器创建独立环境，安装本开发包；Manager 使用仓库 requirements-manager.txt 固定的版本。使用与引擎相同的本地分词器、块哈希配置和固定 PYTHONHASHSEED。下例在两张已分配的 Ascend 910B2 上运行一个 35B 副本。启动引擎和网关的用户需要能读取同一 Linux PID 命名空间内的引擎进程与监听套接字。保持模型和配置文件在服务存续期间只读。
@@ -49,6 +53,7 @@ engine_pid=$!
 - `/status` 提供拓扑、观测到的指标成员、缓存视图、负载新鲜度、各原因次数及最近 64 条请求的进程内分段计时。记录解析、指纹（含分词与哈希）、准入、发送前选点、引擎响应头、首个响应体、可见流内容及结束时刻。非流式回执在完成时解析。首个 HTTP 响应块不能直接用作客户端 TTFT。
 - `X-Lmetric-Reason` 将 `single_replica`、`all_miss`、`equal_hit_native` 与 `unsupported_input`、`topology_mismatch`、`topology_unverified`、`cache_view_unavailable` 分别计数。`longest_prefix` 主动选择最长命中副本；正命中相同且负载采样过期时使用本地积压估计。独立对照模式包括 `--policy native` 和 `--policy prefix`。
 - 负载使用引擎 running/waiting 以及代理在途记账。委托请求的实际副本通常无法从 HTTP 回执直接辨认。串行功能探针使用引擎各 rank 的查询与命中计数增量复核；并发性能实验需要独立的归属证据。
+- 对于有预测的成功请求，dev6 同时核对网关输入长度、引擎输入长度和实际缓存量。长度冲突计入 `mismatched`，其子项 `prompt_length_mismatch` 便于定位分词或模板差异。同一份 usage 中证据不全时计入 `unpaired`，已明确的长度冲突优先。串行探针另检查 token IDs 或引擎聊天分词得到的输入长度，并要求查询量与命中量只在实际执行的 DP rank 增长。
 
 ## Manager 与回滚
 

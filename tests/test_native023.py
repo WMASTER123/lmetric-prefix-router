@@ -4,6 +4,17 @@ import pytest
 
 from lmetric_prefix_router.cache023 import BLOCK, GROUPS, CacheView, block_key
 from lmetric_prefix_router.native023 import NativePool
+from lmetric_prefix_router.receipts import UsageObserver
+
+
+def test_streaming_receipt_never_pairs_counts_from_different_frames():
+    observer = UsageObserver(streaming=True)
+    observer.feed(b'data: {"usage":{"prompt_tokens":2601}}\n\n')
+    observer.feed(
+        b'data: {"usage":{"prompt_tokens_details":{"cached_tokens":2048}}}\n\n'
+    )
+    observer.finish()
+    assert (observer.prompt_tokens, observer.cached_tokens) == (None, None)
 
 
 def store(group, keys):
@@ -53,6 +64,20 @@ def test_bad_removal_invalidates_view():
     with pytest.raises(ValueError, match="corresponding"):
         v.apply(1, [0, [["AllBlocksCleared"], ["BlockRemoved", [1], "GPU", 3]], 1])
     assert not v.trusted
+
+
+def test_hybrid_groups_must_belong_to_the_same_dp_replica():
+    pool = NativePool(rank_count=2)
+    pool.observed_ranks = {0, 1}
+    keys = [block_key(11)]
+    for rank, groups in enumerate(((0, 1), (2, 3))):
+        events = [["AllBlocksCleared"], *[store(g, keys) for g in groups]]
+        pool.views[rank].apply(0, [0, events, rank])
+    row, hit = pool.reserve((2601, keys))
+    assert (row.rank, row.reason, hit) == (None, "all_miss", 0)
+    pool.views[1].apply(1, [0, [store(g, keys) for g in (0, 1)], 1])
+    row, hit = pool.reserve((2601, keys))
+    assert (row.rank, row.reason, hit) == (1, "longest_prefix", BLOCK)
 
 
 def test_extra_key_stores_and_removals_preserve_other_prefixes():
@@ -133,6 +158,15 @@ def test_shared_http_entry_owns_rank_and_releases_stream_reservations(monkeypatc
             )
             await response.write(b"data: [DONE]\n\n")
             return response
+        if payload.get("prompt") == "different length":
+            return web.json_response(
+                {
+                    "usage": {
+                        "prompt_tokens": 2601,
+                        "prompt_tokens_details": {"cached_tokens": 2048},
+                    }
+                }
+            )
         return web.json_response({"usage": {"prompt_tokens": 2200}})
 
     async def run():
@@ -168,6 +202,11 @@ def test_shared_http_entry_owns_rank_and_releases_stream_reservations(monkeypatc
                 assert response.headers["X-Lmetric-Reason"] == "longest_prefix"
                 assert response.headers["X-Lmetric-Expected-Cached"] == "2048"
                 assert b"[DONE]" in await response.read()
+            async with client.post(
+                url, json={"stream": False, "prompt": "different length"}
+            ) as response:
+                assert response.headers["X-Lmetric-Expected-Cached"] == "2048"
+                await response.read()
             feeds[0].invalidate()
             async with client.post(
                 url, json={"stream": False}, headers=headers
@@ -177,7 +216,7 @@ def test_shared_http_entry_owns_rank_and_releases_stream_reservations(monkeypatc
                 await response.read()
             async with client.get("/status") as response:
                 state = await response.json()
-            assert observed == ["1", None]
+            assert observed == ["1", "1", None]
             assert state["active"] == 0
             timing = state["recent_timings"][0]["elapsed_ns"]
             marks = [
@@ -193,12 +232,14 @@ def test_shared_http_entry_owns_rank_and_releases_stream_reservations(monkeypatc
             ]
             assert [timing[k] for k in marks] == sorted(timing[k] for k in marks)
             assert state["route_reasons"] == {
-                "longest_prefix": 1,
+                "longest_prefix": 2,
                 "cache_view_unavailable": 1,
             }
             assert state["counters"] == {
-                "pinned": 1,
+                "pinned": 2,
                 "matched": 1,
+                "mismatched": 1,
+                "prompt_length_mismatch": 1,
                 "delegated": 1,
                 "unpaired": 1,
             }

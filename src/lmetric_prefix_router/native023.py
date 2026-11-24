@@ -275,7 +275,16 @@ def application(
                 timing.http_status = response.status
                 timing.terminal = "completed"
                 if 200 <= response.status < 300:
-                    if predicted is None or observer.cached_tokens is None:
+                    if (
+                        predicted is None
+                        or fp is None
+                        or observer.prompt_tokens is None
+                    ):
+                        counters["unpaired"] += 1
+                    elif observer.prompt_tokens != fp[0]:
+                        counters["mismatched"] += 1
+                        counters["prompt_length_mismatch"] += 1
+                    elif observer.cached_tokens is None:
                         counters["unpaired"] += 1
                     elif predicted == observer.cached_tokens:
                         counters["matched"] += 1

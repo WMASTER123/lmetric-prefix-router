@@ -91,7 +91,12 @@ class UsageObserver:
         prompt = usage.get("prompt_tokens")
         details = usage.get("prompt_tokens_details")
         cached = details.get("cached_tokens") if isinstance(details, dict) else None
-        if type(prompt) is int and prompt >= 0:
-            self.prompt_tokens = prompt
-        if type(cached) is int and 0 <= cached <= (self.prompt_tokens or 0):
-            self.cached_tokens = cached
+        # Treat each usage object as one receipt, even with continuous SSE usage.
+        self.prompt_tokens = prompt if type(prompt) is int and prompt >= 0 else None
+        self.cached_tokens = (
+            cached
+            if self.prompt_tokens is not None
+            and type(cached) is int
+            and 0 <= cached <= self.prompt_tokens
+            else None
+        )

@@ -46,8 +46,16 @@ def run(engine, router, model, dp, tp, block, rejoin=False):
         return result
 
     def request(
-        label, endpoint, prompt, route_reason=None, pin=None, expected=0, chat=False
+        label,
+        endpoint,
+        prompt,
+        route_reason=None,
+        pin=None,
+        expected=0,
+        chat_tokens=None,
     ):
+        chat = chat_tokens is not None
+        n = len(chat_tokens if chat else prompt)
         path = "/v1/chat/completions" if chat else "/v1/completions"
         key = "messages" if chat else "prompt"
         payload = {"model": model, key: prompt, "temperature": 0, "max_tokens": 2}
@@ -58,15 +66,21 @@ def run(engine, router, model, dp, tp, block, rejoin=False):
             {"X-Data-Parallel-Rank": str(pin)} if pin is not None else {},
         )
         usage = json.loads(raw)["usage"]
-        n = usage["prompt_tokens"]
+        assert usage["prompt_tokens"] == n, (label, n, usage["prompt_tokens"])
         after = wait_for(
             metrics,
             lambda s: sum(s["queries"].values()) > sum(before["queries"].values()),
         )
         q = [after["queries"][i] - before["queries"][i] for i in range(dp)]
         h = [after["hits"][i] - before["hits"][i] for i in range(dp)]
-        actual = q.index(n)
-        assert sum(q) == n and h[actual] == sum(h) == expected
+        owners = [rank for rank in range(dp) if q[rank] == n]
+        assert len(owners) == 1, (label, n, q)
+        actual = owners[0]
+        assert q == [n if rank == actual else 0 for rank in range(dp)], (label, q)
+        assert h == [expected if rank == actual else 0 for rank in range(dp)], (
+            label,
+            h,
+        )
         receipt = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
         assert receipt == expected or (expected == 0 and receipt is None)
         if route_reason:
@@ -87,6 +101,7 @@ def run(engine, router, model, dp, tp, block, rejoin=False):
                     actual_rank=actual,
                     reason=headers.get("X-Lmetric-Reason"),
                     predicted=headers.get("X-Lmetric-Expected-Cached"),
+                    prompt_tokens=n,
                     usage_cached=receipt,
                     queries_delta=q,
                     hits_delta=h,
@@ -157,7 +172,7 @@ def run(engine, router, model, dp, tp, block, rejoin=False):
         fetch(engine + "/tokenize", {"model": model, "messages": messages})[1]
     )["tokens"]
     old = seq(0)
-    request("chat-seed", engine, messages, pin=0, chat=True)
+    request("chat-seed", engine, messages, pin=0, chat_tokens=tokens)
     advanced(0, old)
     request(
         "chat-hot",
@@ -165,7 +180,7 @@ def run(engine, router, model, dp, tp, block, rejoin=False):
         messages,
         ("native", "single_replica") if dp == 1 else ("0", "longest_prefix"),
         expected=(len(tokens) - 1) // block * block,
-        chat=True,
+        chat_tokens=tokens,
     )
     print(json.dumps({"final": state()}), flush=True)
 
