@@ -1,5 +1,7 @@
 # r10 接入条件
 
+此文档只管理冻结 r10 的保留线。当前主开发入口为[预装 vLLM 0.23](native023.md)。两线分别记录安装、派发、命中和上线资格。
+
 目标为 vLLM-HUST Engine 2026.11.21.10 的 Qwen3.5-35B-A3B BF16。采用官方安装器和四项发布制品，核对 Python、CANN、卡型、模型配置、tokenizer、模板和物理设备映射。性能记录由实验环境单独归档。[官方分发制品](https://github.com/vLLM-HUST/vllm-hust-website/releases/tag/engine-wheels-r10-v1)
 
 ## 部署

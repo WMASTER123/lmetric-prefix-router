@@ -4,15 +4,16 @@ build-backend = "hatchling.build"
 
 [project]
 name = "lmetric-prefix-router"
-version = "0.1.0.dev0"
-description = "lmetric-prefix-router inert vLLM-HUST contract descriptor"
+version = "0.1.0.dev1"
+description = "Prefix-aware replica placement for local vLLM serving"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
 dependencies = ["aiohttp>=3.10,<4"]
 
 [project.optional-dependencies]
-test = ["pytest>=8", "ruff>=0.12", "vllm-hust-ext @ git+https://github.com/vLLM-HUST/extension-manager.git@a39e78ca5d2b36bd09b878a1b6f48a6e61d9302d"]
+native023 = ["msgspec>=0.18,<1", "pyzmq>=25,<28"]
+test = ["msgspec>=0.18,<1", "pyzmq>=25,<28", "pytest>=8", "ruff>=0.12", "vllm-hust-ext @ git+https://github.com/vLLM-HUST/extension-manager.git@a39e78ca5d2b36bd09b878a1b6f48a6e61d9302d"]
 
 [tool.hatch.metadata]
 allow-direct-references = true

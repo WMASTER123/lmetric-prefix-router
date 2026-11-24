@@ -19,7 +19,7 @@
     "status": "experimental",
     "default_enabled": false,
     "activation_contract": "Discovery only during qualification",
-    "rollback_contract": "Uninstall the development package"
+    "rollback_contract": "Switch new traffic to the original engine, drain the standalone gateway, stop it, then uninstall the development package"
   },
   "scope": {
     "mechanism": "Longest-prefix-preserving load selection before dispatch",
