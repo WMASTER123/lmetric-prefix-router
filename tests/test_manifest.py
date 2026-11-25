@@ -34,7 +34,7 @@ def test_provider_checks_running_service_identity(monkeypatch, wrong):
         replay_endpoints={"0": "tcp://127.0.0.1:18400"},
     )
     status = dict(
-        version="0.1.0.dev6",
+        version="0.1.0.dev7",
         extension_id=provider.BUNDLE_ID,
         backend=config["backend_url"],
         engine_generation=config["engine_generation"],
@@ -44,7 +44,7 @@ def test_provider_checks_running_service_identity(monkeypatch, wrong):
     )
     if wrong:
         status[wrong] = False
-    monkeypatch.setattr(provider, "version", lambda _: "0.1.0.dev6")
+    monkeypatch.setattr(provider, "version", lambda _: "0.1.0.dev7")
     monkeypatch.setattr(
         provider,
         "get",

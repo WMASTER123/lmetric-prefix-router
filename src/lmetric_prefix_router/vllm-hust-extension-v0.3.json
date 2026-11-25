@@ -1,12 +1,12 @@
 {
   "schema_version": "0.3",
   "extension_id": "io.github.wmaster123.lmetric-prefix-router",
-  "extension_version": "0.1.0.dev6",
+  "extension_version": "0.1.0.dev7",
   "kind": "control_plane_extension",
   "host": {
     "provider": "lmetric-prefix-router",
     "name": "lmetric-prefix-router",
-    "version_range": "==0.1.0.dev6"
+    "version_range": "==0.1.0.dev7"
   },
   "runtime": {
     "type": "external_service",

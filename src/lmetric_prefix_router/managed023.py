@@ -13,7 +13,7 @@ import msgspec
 import zmq
 import zmq.asyncio
 
-from .cache023 import BLOCK, GROUPS
+from .cache023 import BLOCK, GROUPS, CacheView
 from .events023 import FEED_ERRORS, MAX_BATCHES, MAX_BYTES
 
 
@@ -159,8 +159,8 @@ class LocalEngine:
             return False
 
 
-async def read_delta(ctx, endpoint, start):
-    """Only a contiguous response ending in END_SEQ can be committed."""
+async def read_delta(ctx, endpoint, start, *, snapshot=None):
+    """Validate through END_SEQ. A private snapshot folds history as it arrives."""
     sock = ctx.socket(zmq.DEALER)
     try:
         sock.setsockopt(zmq.MAXMSGSIZE, MAX_BYTES)
@@ -169,20 +169,25 @@ async def read_delta(ctx, endpoint, start):
         await sock.send_multipart([b"", start.to_bytes(8, "big")])
         rows = []
         size = 0
+        sequence = start
         while True:
             delim, seq, body = await sock.recv_multipart()
             if delim or len(seq) != 8:
                 raise ValueError("invalid replay envelope")
             if seq == b"\xff" * 8 and not body:
                 return rows
-            size += len(body)
-            if (
-                int.from_bytes(seq, "big") != start + len(rows)
-                or len(rows) >= MAX_BATCHES
-                or size > MAX_BYTES
-            ):
-                raise ValueError("incomplete or oversized replay history")
-            rows.append(msgspec.msgpack.decode(body))
+            if int.from_bytes(seq, "big") != sequence or not body:
+                raise ValueError("incomplete replay history")
+            if snapshot is None:
+                size += len(body)
+                if len(rows) >= MAX_BATCHES or size > MAX_BYTES:
+                    raise ValueError("oversized incremental replay")
+                rows.append(msgspec.msgpack.decode(body))
+            else:
+                snapshot.apply(sequence, msgspec.msgpack.decode(body))
+                if (sequence + 1) % 32 == 0:
+                    await asyncio.sleep(0)
+            sequence += 1
     finally:
         sock.close(linger=0)
 
@@ -199,19 +204,32 @@ class ManagedReplay:
                 if not self.engine.current(view.rank):
                     view.invalidate("generation_changed")
                     return
-                rows = await asyncio.wait_for(read_delta(self.ctx, endpoint, start), 1)
+                began = time.monotonic()
+                snapshot = None
+                if start == 0:
+                    snapshot = CacheView(view.rank, view.block_size, view.specs)
+                    snapshot.trusted = True  # Bound scheduler starts with empty pools.
+                rows = await asyncio.wait_for(
+                    read_delta(self.ctx, endpoint, start, snapshot=snapshot),
+                    30 if snapshot is not None else 1,
+                )
                 if not self.engine.current(view.rank):
                     view.invalidate("generation_changed")
                     return
-                if start == 0:
-                    view.invalidate()
-                    view.sequence = None
-                    view.trusted = True
-                for i, batch in enumerate(rows, start):
-                    view.apply(i, batch)
-                start += len(rows)
-                view.sync_state = "managed_contiguous"
-                view.valid_until = time.monotonic() + 1.25
+                if snapshot is not None:
+                    view.groups, view.excluded = snapshot.groups, snapshot.excluded
+                    view.sequence, view.trusted = snapshot.sequence, snapshot.trusted
+                    start = 0 if snapshot.sequence is None else snapshot.sequence + 1
+                else:
+                    for i, batch in enumerate(rows, start):
+                        view.apply(i, batch)
+                    start += len(rows)
+                if time.monotonic() - began > 1:
+                    view.valid_until = 0
+                    view.sync_state = "awaiting_fresh_tail"
+                else:
+                    view.sync_state = "managed_contiguous"
+                    view.valid_until = time.monotonic() + 1.25
             except (asyncio.TimeoutError, zmq.ZMQError):
                 # No batch is applied until its entire reply is checked. Preserve the
                 # committed cursor while withholding predictions until a fresh poll.
