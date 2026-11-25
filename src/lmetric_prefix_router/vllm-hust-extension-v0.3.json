@@ -1,0 +1,64 @@
+{
+  "schema_version": "0.3",
+  "extension_id": "io.github.wmaster123.lmetric-prefix-router",
+  "extension_version": "0.1.0.dev7",
+  "kind": "control_plane_extension",
+  "host": {
+    "provider": "lmetric-prefix-router",
+    "name": "lmetric-prefix-router",
+    "version_range": "==0.1.0.dev7"
+  },
+  "runtime": {
+    "type": "external_service",
+    "process_scope": "cluster",
+    "isolation": "process_isolated"
+  },
+  "lifecycle_owner": "user",
+  "protocols": [
+    {
+      "name": "openai.http",
+      "version_range": null
+    },
+    {
+      "name": "vllm.kv-events",
+      "version_range": null
+    }
+  ],
+  "implementation": [
+    {
+      "type": "python_module",
+      "module": "lmetric_prefix_router.native023",
+      "object": "main",
+      "status": "active"
+    }
+  ],
+  "requires_services": [
+    {
+      "service_id": "shared-engine",
+      "protocol": "openai.http",
+      "version_range": null,
+      "endpoint_config": "backend_url",
+      "optional": false
+    },
+    {
+      "service_id": "process-bound-replay",
+      "protocol": "vllm.kv-events",
+      "version_range": null,
+      "endpoint_config": "replay_endpoints",
+      "optional": false
+    }
+  ],
+  "requires_extensions": [],
+  "resource_claims": [
+    {
+      "resource": "vllm.request-routing.front-door",
+      "scope": "deployment",
+      "mode": "exclusive"
+    }
+  ],
+  "activation": {
+    "entry_points": [],
+    "environment": {},
+    "additional_config": {}
+  }
+}

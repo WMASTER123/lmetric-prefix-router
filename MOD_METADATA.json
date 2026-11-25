@@ -1,0 +1,38 @@
+{
+  "schema_version": "vllm-hust-mod-metadata-v1",
+  "mod_id": "io.github.wmaster123.lmetric-prefix-router",
+  "repository": "lmetric-prefix-router",
+  "display_name": "lmetric-prefix-router",
+  "canonical_repository": "https://github.com/WMASTER123/lmetric-prefix-router",
+  "responsibility": {
+    "organization": "WMASTER123",
+    "maintainers": [
+      {
+        "name": "WMASTER123",
+        "github": "WMASTER123"
+      }
+    ],
+    "advisor_status": "unknown",
+    "advisors": []
+  },
+  "lifecycle": {
+    "status": "experimental",
+    "default_enabled": false,
+    "activation_contract": "Operator-managed local native023 service. Manager verifies the bound deployment and records enable intent.",
+    "rollback_contract": "Switch new traffic to the original engine, drain the standalone gateway, stop it, then uninstall the development package"
+  },
+  "scope": {
+    "mechanism": "Longest-prefix-preserving load selection before dispatch",
+    "supported_workloads": [],
+    "out_of_scope": [
+      "KV transfer",
+      "migration of running requests"
+    ]
+  },
+  "evidence": {
+    "qualification": "unqualified",
+    "latest_result": null,
+    "index": "README.md",
+    "performance_claims": []
+  }
+}
